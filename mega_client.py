@@ -2,6 +2,7 @@
 MEGA API Client - Reverse Engineered
 يُعمل بنفس طريقة MegaBasterd الأصلي (Java)
 بدون حساب وبدون حزن 🎯
+يدعم الملفات والمجلدات العامة
 """
 
 import httpx
@@ -10,10 +11,9 @@ import random
 import string
 from typing import Optional, Dict, Any, List, Tuple
 from dataclasses import dataclass
-from enum import Enum
 import logging
-from urllib.parse import urlparse, parse_qs
 import asyncio
+import base64
 
 # إعداد logging
 logging.basicConfig(
@@ -75,10 +75,20 @@ class CryptoTools:
         return decrypted
     
     @staticmethod
+    def aes_cbc_decrypt_no_pad(
+        ciphertext: bytes,
+        key: bytes,
+        iv: bytes
+    ) -> bytes:
+        """فك تشفير AES-CBC بدون إزالة padding (للـ attributes)"""
+        from Crypto.Cipher import AES
+        
+        cipher = AES.new(key, AES.MODE_CBC, iv)
+        return cipher.decrypt(ciphertext)
+    
+    @staticmethod
     def base64_url_decode(s: str) -> bytes:
         """فك تشفير Base64 (MEGA style - no padding)"""
-        import base64
-        
         # أضف padding إذا لزم الأمر
         padding = 4 - (len(s) % 4)
         if padding != 4:
@@ -96,8 +106,6 @@ class CryptoTools:
     @staticmethod
     def base64_url_encode(data: bytes) -> str:
         """تشفير Base64 (MEGA style)"""
-        import base64
-        
         encoded = base64.b64encode(data).decode('utf-8')
         # استبدل الأحرف
         encoded = encoded.replace('+', '-').replace('/', '_').rstrip('=')
@@ -284,53 +292,12 @@ class MegaAPIClient:
         }
         return error_codes.get(code, f"Unknown error: {code}")
     
-    async def get_file_metadata(self, link: str) -> Tuple[str, int, str]:
-        """
-        الحصول على معلومات الملف من رابط عام
-        يرجع: (اسم_الملف، الحجم، المفتاح)
-        
-        الرابط يكون: https://mega.nz/file/FILE_ID#KEY
-        """
-        # استخراج FILE_ID والمفتاح من الرابط
-        file_id, key_str = self._extract_file_info(link)
-        
-        if not file_id or not key_str:
-            raise ValueError("Invalid MEGA link format")
-        
-        logger.info(f"Fetching metadata for file: {file_id}")
-        
-        # بناء الطلب (نفس Java MegaAPI)
-        request = [
-            {
-                "a": "g",  # get file
-                "p": file_id,  # path (file ID للملف العام)
-            }
-        ]
-        
-        try:
-            response = await self._raw_request(request)
-            
-            # معالجة الرد
-            if isinstance(response, dict):
-                # فك تشفير الاسم والمفتاح من الـ attributes
-                size = response.get('s', 0)
-                encrypted_attrs = response.get('at', '')
-                
-                # اسم الملف محفوظ في 'at' (attributes) مشفر
-                file_name = self._decrypt_attributes(encrypted_attrs, key_str)
-                
-                return file_name or "Unknown", size, key_str
-            
-            raise MegaAPIException(-1, "Invalid response format")
-        
-        except Exception as e:
-            logger.error(f"Failed to get file metadata: {e}")
-            raise
-    
     async def get_folder_metadata(self, link: str) -> FolderContent:
         """
-        الحصول على محتويات المجلد
+        الحصول على محتويات المجلد - نفس طريقة Java
         الرابط: https://mega.nz/folder/FOLDER_ID#KEY
+        
+        هذه الطريقة تجلب شجرة الملفات كاملة بدون حساب
         """
         folder_id, key_str = self._extract_file_info(link)
         
@@ -339,17 +306,19 @@ class MegaAPIClient:
         
         logger.info(f"Fetching folder metadata for: {folder_id}")
         
-        # الطلب الأول: الحصول على شكل الشجرة
+        # فك تشفير المفتاح الأساسي
+        key_bytes = CryptoTools.base64_url_decode(key_str)
+        
+        # الطلب: جلب شجرة الملفات بدون تسجيل دخول
+        # نفس الطريقة من Java: MegaAPI.fetchNodes()
         request = [
             {
-                "a": "f",  # fetch tree
-                "c": 1,     # include all
-                "r": 1,     # root only
+                "a": "f",  # fetch (جلب شجرة الملفات)
+                "c": 1,    # اشمل الكل
             }
         ]
         
         try:
-            # نحتاج session ID أو نستخدم request مباشر
             response = await self._raw_request(request)
             
             # معالجة الرد وبناء شجرة الملفات
@@ -357,8 +326,9 @@ class MegaAPIClient:
             folders = []
             
             if isinstance(response, dict) and 'f' in response:
+                # معالجة العقد
                 for item in response['f']:
-                    file_info = self._parse_file_node(item, key_str)
+                    file_info = self._parse_folder_node(item, key_bytes)
                     if file_info:
                         if file_info.type == "folder":
                             folders.append(file_info)
@@ -371,21 +341,53 @@ class MegaAPIClient:
             logger.error(f"Failed to get folder metadata: {e}")
             raise
     
+    async def get_file_metadata(self, link: str) -> Tuple[str, int, str]:
+        """
+        الحصول على معلومات الملف من رابط عام
+        يرجع: (اسم_الملف، الحجم، المفتاح)
+        """
+        file_id, key_str = self._extract_file_info(link)
+        
+        if not file_id or not key_str:
+            raise ValueError("Invalid MEGA link format")
+        
+        logger.info(f"Fetching metadata for file: {file_id}")
+        
+        # بناء الطلب
+        request = [
+            {
+                "a": "g",  # get file
+                "p": file_id,
+            }
+        ]
+        
+        try:
+            response = await self._raw_request(request)
+            
+            if isinstance(response, dict):
+                size = response.get('s', 0)
+                encrypted_attrs = response.get('at', '')
+                
+                file_name = self._decrypt_attributes(encrypted_attrs, key_str)
+                
+                return file_name or "Unknown", size, key_str
+            
+            raise MegaAPIException(-1, "Invalid response format")
+        
+        except Exception as e:
+            logger.error(f"Failed to get file metadata: {e}")
+            raise
+    
     @staticmethod
     def _extract_file_info(link: str) -> Tuple[Optional[str], Optional[str]]:
         """استخراج FILE_ID والمفتاح من رابط MEGA"""
         try:
-            # صيغة الرابط: https://mega.nz/file/FILE_ID#KEY
-            # أو: https://mega.co.nz/file/FILE_ID#KEY
-            
             if '#' not in link:
                 return None, None
             
-            # استخراج الجزء قبل #
             before_hash = link.split('#')[0]
             key = link.split('#')[1]
             
-            # استخراج FILE_ID من آخر جزء من الـ path
             parts = before_hash.rstrip('/').split('/')
             file_id = parts[-1]
             
@@ -397,31 +399,25 @@ class MegaAPIClient:
     
     @staticmethod
     def _decrypt_attributes(encrypted_attrs: str, key_str: str) -> Optional[str]:
-        """
-        فك تشفير الـ attributes للحصول على اسم الملف
-        نفس طريقة Java
-        """
+        """فك تشفير الـ attributes للحصول على اسم الملف"""
         try:
-            # فك تشفير المفتاح الأساسي
             key_bytes = CryptoTools.base64_url_decode(key_str)
             
-            # المفتاح الأول 16 bytes للـ IV
-            # والـ 16 bytes التالي هي للمفتاح الفعلي
             if len(key_bytes) >= 32:
-                actual_key = key_bytes[:16]
                 file_key = key_bytes[16:32]
             else:
-                actual_key = key_bytes
                 file_key = key_bytes
             
-            # فك تشفير الـ attributes
             encrypted = CryptoTools.base64_url_decode(encrypted_attrs)
             
-            # MEGA تستخدم AES-CBC مع IV الصفري للـ attributes
             iv = b'\x00' * 16
-            decrypted = CryptoTools.aes_cbc_decrypt(encrypted, actual_key, iv)
+            decrypted = CryptoTools.aes_cbc_decrypt_no_pad(encrypted, file_key, iv)
             
-            # البيانات مشفرة كـ JSON بعد فك التشفير
+            # إزالة padding يدويّاً
+            padding_length = decrypted[-1] if decrypted else 0
+            if 0 < padding_length <= 16:
+                decrypted = decrypted[:-padding_length]
+            
             attr_json = decrypted.decode('utf-8', errors='ignore')
             attr_dict = json.loads(attr_json)
             
@@ -432,35 +428,61 @@ class MegaAPIClient:
             return None
     
     @staticmethod
-    def _parse_file_node(
+    def _parse_folder_node(
         node: Dict[str, Any],
-        parent_key: str
+        parent_key: bytes
     ) -> Optional[FileInfo]:
-        """تحليل عقدة ملف من الرد"""
+        """تحليل عقدة ملف من المجلد"""
         try:
             node_type = node.get('t', 0)
             node_id = node.get('h')
             size = node.get('s', 0)
             encrypted_key = node.get('k', '')
+            encrypted_attrs = node.get('a', '')
             
-            # نوع العقدة:
-            # 0 = file
-            # 1 = dir
-            # 2 = root
-            # 3 = inbox
-            # 4 = trash
-            
-            if node_type == 0:
-                file_type = "file"
-                name = f"file_{node_id}"
-            elif node_type == 1:
-                file_type = "folder"
-                name = f"folder_{node_id}"
-            else:
+            if node_type not in [0, 1]:
                 return None
             
+            file_type = "folder" if node_type == 1 else "file"
+            
+            file_name = "Unknown"
+            
+            try:
+                if encrypted_key and len(parent_key) > 0:
+                    key_bytes = CryptoTools.base64_url_decode(encrypted_key)
+                    actual_key = CryptoTools.decrypt_key(key_bytes, CryptoTools.str_to_a32(parent_key))
+                    node_key = actual_key
+                else:
+                    node_key = parent_key
+                
+                if encrypted_attrs:
+                    attr_bytes = CryptoTools.base64_url_decode(encrypted_attrs)
+                    
+                    if len(attr_bytes) > 8:
+                        attr_data = attr_bytes[8:]
+                    else:
+                        attr_data = attr_bytes
+                    
+                    iv = b'\x00' * 16
+                    try:
+                        decrypted = CryptoTools.aes_cbc_decrypt_no_pad(attr_data, node_key[:16], iv)
+                        
+                        padding_length = decrypted[-1] if decrypted else 0
+                        if 0 < padding_length <= 16:
+                            decrypted = decrypted[:-padding_length]
+                        
+                        attr_json = decrypted.decode('utf-8', errors='ignore')
+                        attr_dict = json.loads(attr_json)
+                        file_name = attr_dict.get('n', file_name)
+                    
+                    except Exception as e:
+                        logger.debug(f"Could not decrypt node attributes: {e}")
+            
+            except Exception as e:
+                logger.debug(f"Error processing node key: {e}")
+            
             return FileInfo(
-                name=name,
+                name=file_name,
                 size=size,
                 key=encrypted_key,
                 type=file_type,
@@ -469,7 +491,7 @@ class MegaAPIClient:
             )
         
         except Exception as e:
-            logger.debug(f"Failed to parse file node: {e}")
+            logger.debug(f"Failed to parse folder node: {e}")
             return None
 
 
@@ -494,49 +516,3 @@ class MegaAPIException(MegaException):
 class MegaNetworkException(MegaException):
     """خطأ في الاتصال الشبكي"""
     pass
-
-
-# ============================================================================
-# 🧪 اختبار سريع
-# ============================================================================
-
-async def main():
-    """اختبار العميل"""
-    
-    # مثال على رابط ملف عام
-    test_link = "https://mega.nz/file/abcd1234#efgh5678ijkl9012mnop"
-    
-    print("=" * 70)
-    print("🎯 MEGA API Client - Reverse Engineered")
-    print("=" * 70)
-    print(f"\n📍 Test Link: {test_link}")
-    print(f"📥 Extracting file info without authentication...\n")
-    
-    try:
-        async with MegaAPIClient(timeout=10) as client:
-            # اختبر إذا كان الرابط صحيح
-            file_id, key = client._extract_file_info(test_link)
-            
-            if file_id and key:
-                print(f"✅ File ID: {file_id}")
-                print(f"✅ Key: {key}")
-                
-                # محاولة الحصول على البيانات الوصفية
-                # (قد لا تعمل إذا كان الملف غير موجود)
-                try:
-                    name, size, _ = await client.get_file_metadata(test_link)
-                    print(f"✅ File Name: {name}")
-                    print(f"✅ File Size: {FileInfo._format_size(size)}")
-                except MegaAPIException as e:
-                    print(f"⚠️  API Error: {e}")
-                    print("💡 Hint: Use a valid MEGA public link for testing")
-            else:
-                print("❌ Invalid link format")
-    
-    except Exception as e:
-        logger.error(f"Error: {e}")
-        print(f"❌ Error: {e}")
-
-
-if __name__ == "__main__":
-    asyncio.run(main())
